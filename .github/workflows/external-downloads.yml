@@ -13,6 +13,8 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: Check hook lifecycle regressions
+        run: python3 ExternalDownloads/test_runtime_helpers.py
       - name: Build iPhone add-on
         run: |
           mkdir -p build

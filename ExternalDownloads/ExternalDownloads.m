@@ -12,6 +12,27 @@ static NSArray *EDPlaylistPolicies;
 static NSArray *EDCollectionPolicies;
 static BOOL EDCollectionWasObserved;
 static __weak id EDSpotifyPlayer;
+static NSMutableDictionary<NSString *, NSValue *> *EDInstalledHooks;
+
+static Class EDClass(NSString *name) {
+    Class cls = NSClassFromString(name);
+    if (cls) return cls;
+    NSDictionary *mangled = @{
+        @"Offline_ContentOffliningUIImpl.ContentOffliningUIHelperImplementation": @"_TtC30Offline_ContentOffliningUIImpl38ContentOffliningUIHelperImplementation",
+        @"NowPlaying_PlatformImpl.StatefulPlayerImplementation": @"_TtC23NowPlaying_PlatformImpl28StatefulPlayerImplementation",
+        @"Collection_DataLoaderImpl.CollectionEsperantoDataLoader": @"_TtC25Collection_DataLoaderImpl29CollectionEsperantoDataLoader",
+        @"ContextMenu_PlatformLegacyAdapterImpl.PresenterFactory": @"_TtC37ContextMenu_PlatformLegacyAdapterImpl16PresenterFactory",
+        @"ContextMenu_InternalImpl.ContextMenuViewController": @"_TtC24ContextMenu_InternalImpl25ContextMenuViewController",
+        @"Collection_DataLoaderImpl.CollectionDataLoaderTrackResponse": @"_TtC25Collection_DataLoaderImpl33CollectionDataLoaderTrackResponse"
+    };
+    NSString *runtimeName = mangled[name];
+    return runtimeName ? objc_lookUpClass(runtimeName.UTF8String) : Nil;
+}
+
+static BOOL EDIsCollection(NSString *uri) {
+    return [uri isEqualToString:@"spotify:collection"] || [uri containsString:@":collection:tracks"] ||
+           [uri hasSuffix:@":collection"];
+}
 
 static NSError *EDError(NSString *message) {
     return [NSError errorWithDomain:@"ExternalDownloads" code:1
@@ -26,6 +47,7 @@ static id EDGet(id object, NSString *name) {
 
 static NSString *EDString(id value) {
     if ([value isKindOfClass:NSString.class]) return value;
+    if ([value isKindOfClass:NSAttributedString.class]) return [value string];
     if ([value isKindOfClass:NSURL.class]) return [value absoluteString];
     return @"";
 }
@@ -58,30 +80,94 @@ static NSURL *EDRoot(void) {
 @implementation EDTrack
 @end
 
+static NSMutableDictionary<NSString *, EDTrack *> *EDKnownTracks;
+static NSMutableDictionary<NSString *, NSMutableDictionary<NSString *, EDTrack *> *> *EDTracksByTitle;
+static void EDRefreshRows(void);
+
+static void EDRememberTrack(EDTrack *track) {
+    if (!EDKnownTracks) EDKnownTracks = [NSMutableDictionary dictionary];
+    if (!EDTracksByTitle) EDTracksByTitle = [NSMutableDictionary dictionary];
+    EDKnownTracks[track.identifier] = track;
+    NSString *key = EDNormalized(track.title);
+    if (!EDTracksByTitle[key]) EDTracksByTitle[key] = [NSMutableDictionary dictionary];
+    EDTracksByTitle[key][track.identifier] = track;
+    static BOOL refreshPending;
+    if (!refreshPending) {
+        refreshPending = YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 10), dispatch_get_main_queue(), ^{
+            refreshPending = NO;
+            EDRefreshRows();
+        });
+    }
+}
+
+static EDTrack *EDTrackFromItem(id item) {
+    NSString *uri = EDString(EDGet(item, @"URL"));
+    if (![uri hasPrefix:@"spotify:track:"]) return nil;
+    NSString *identifier = [[uri componentsSeparatedByString:@":"] lastObject];
+    if (identifier.length != 22 || [identifier rangeOfCharacterFromSet:NSCharacterSet.alphanumericCharacterSet.invertedSet].location != NSNotFound) return nil;
+    EDTrack *track = [EDTrack new];
+    track.identifier = identifier;
+    track.title = EDString(EDGet(item, @"name"));
+    id artists = EDGet(item, @"artists");
+    track.artist = [artists isKindOfClass:NSArray.class] ? EDString(EDGet([artists firstObject], @"name")) : @"";
+    if (!track.title.length || !track.artist.length) return nil;
+    track.status = @"Ожидает загрузки";
+    return track;
+}
+
+static void EDRegisterItem(id item) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        EDTrack *track = EDTrackFromItem(item);
+        if (!track) return;
+        EDRememberTrack(track);
+    });
+}
+
 static NSArray<EDTrack *> *EDTracks(id response) {
     id items = EDGet(response, @"items");
     if (![items isKindOfClass:NSArray.class]) return nil;
     NSMutableArray *tracks = [NSMutableArray array];
     for (id item in items) {
-        NSString *uri = EDString(EDGet(item, @"URL"));
-        if (![uri hasPrefix:@"spotify:track:"]) continue;
-        NSString *identifier = uri.lastPathComponent;
-        identifier = [[identifier componentsSeparatedByString:@":"] lastObject];
-        if (identifier.length != 22 || [identifier rangeOfCharacterFromSet:NSCharacterSet.alphanumericCharacterSet.invertedSet].location != NSNotFound) continue;
-        EDTrack *track = [EDTrack new];
-        track.identifier = identifier;
-        track.title = EDString(EDGet(item, @"name"));
-        id artists = EDGet(item, @"artists");
-        track.artist = [artists isKindOfClass:NSArray.class] ? EDString(EDGet([artists firstObject], @"name")) : @"";
-        if (!track.title.length || !track.artist.length) continue;
-        track.status = @"Ожидает загрузки";
+        EDTrack *track = EDTrackFromItem(item);
+        if (!track) continue;
         [tracks addObject:track];
     }
     return tracks;
 }
 
+static void EDCaptureResponse(id response) {
+    id items = EDGet(response, @"items");
+    if ([items isKindOfClass:NSArray.class]) for (id item in items) EDRegisterItem(item);
+}
+
+static id EDCapturedReply(id reply) {
+    if (!reply) return nil;
+    return [^(id response) {
+        EDCaptureResponse(response);
+        ((EDReply)reply)(response);
+    } copy];
+}
+
+static id EDCapturedViewReply(id reply) {
+    if (!reply) return nil;
+    return [^(id metadata, id tracks) {
+        EDCaptureResponse(tracks);
+        ((void (^)(id, id))reply)(metadata, tracks);
+    } copy];
+}
+
+static id EDCapturedRecommendationsReply(id reply) {
+    if (!reply) return nil;
+    return [^(id metadata, id tracks, id recommendations) {
+        EDCaptureResponse(tracks);
+        ((void (^)(id, id, id))reply)(metadata, tracks, recommendations);
+    } copy];
+}
+
 @interface EDDownloads : UITableViewController <NSURLSessionTaskDelegate>
 @property(nonatomic, strong) NSMutableArray<EDTrack *> *tracks;
+@property(nonatomic, strong) NSMutableArray<EDTrack *> *pendingTracks;
 @property(nonatomic, strong) NSURLSession *session;
 @property(nonatomic, strong) NSURLSessionTask *activeTask;
 @property(nonatomic, strong) AVPlayer *player;
@@ -92,6 +178,7 @@ static NSArray<EDTrack *> *EDTracks(id response) {
 @property(nonatomic, copy) NSString *statusText;
 + (instancetype)shared;
 - (void)openPage:(NSURL *)page;
+- (void)downloadSingleTrack:(EDTrack *)track;
 - (void)loadCollectionAt:(NSUInteger)offset generation:(NSUInteger)generation accumulated:(NSMutableArray *)tracks;
 @end
 
@@ -105,6 +192,7 @@ static NSArray<EDTrack *> *EDTracks(id response) {
 - (instancetype)initWithStyle:(UITableViewStyle)style {
     if ((self = [super initWithStyle:style])) {
         _tracks = [NSMutableArray array];
+        _pendingTracks = [NSMutableArray array];
         NSURLSessionConfiguration *configuration = NSURLSessionConfiguration.ephemeralSessionConfiguration;
         configuration.timeoutIntervalForRequest = 30;
         configuration.timeoutIntervalForResource = 180;
@@ -115,7 +203,7 @@ static NSArray<EDTrack *> *EDTracks(id response) {
 }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Скачанные";
+    self.title = @"Скачанные · v2";
     self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose target:self action:@selector(close)];
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Остановить" style:UIBarButtonItemStylePlain target:self action:@selector(stop)];
 }
@@ -123,6 +211,7 @@ static NSArray<EDTrack *> *EDTracks(id response) {
 - (void)stop {
     self.running = NO;
     self.generation++;
+    [self.pendingTracks removeAllObjects];
     [self.activeTask cancel];
     self.activeTask = nil;
     self.statusText = @"Загрузка остановлена. Нажми «Скачать» снова для повтора.";
@@ -175,7 +264,7 @@ static NSArray<EDTrack *> *EDTracks(id response) {
             self.generation++;
         }
     });
-    if ([self.pageURI containsString:@":collection:tracks"]) {
+    if (EDIsCollection(self.pageURI)) {
         [self loadCollectionAt:0 generation:generation accumulated:[NSMutableArray array]];
         return;
     }
@@ -202,6 +291,24 @@ static NSArray<EDTrack *> *EDTracks(id response) {
         });
     };
     ((void (*)(id, SEL, id, id, id, BOOL, id, id))objc_msgSend)(loader, fetch, page, options, EDPlaylistPolicies, YES, reply, failure);
+}
+- (void)downloadSingleTrack:(EDTrack *)track {
+    [self show];
+    if (self.running) {
+        if ([self.statusText isEqualToString:@"Читаю список треков…"]) {
+            [self.pendingTracks addObject:track];
+            return;
+        }
+        for (EDTrack *existing in self.tracks) if ([existing.identifier isEqualToString:track.identifier]) return;
+        [self.tracks addObject:track];
+        [self saveCatalog];
+        [self.tableView reloadData];
+        return;
+    }
+    self.pageURI = [@"spotify:track:" stringByAppendingString:track.identifier];
+    self.running = YES;
+    self.generation++;
+    [self beginTracks:@[track]];
 }
 - (void)loadCollectionAt:(NSUInteger)offset generation:(NSUInteger)generation accumulated:(NSMutableArray *)tracks {
     id loader = EDCollectionLoader;
@@ -251,7 +358,9 @@ static NSArray<EDTrack *> *EDTracks(id response) {
     }
     self.tracks = [NSMutableArray array];
     NSMutableSet *seen = [NSMutableSet set];
-    for (EDTrack *track in tracks) {
+    NSArray *combined = [tracks arrayByAddingObjectsFromArray:self.pendingTracks];
+    [self.pendingTracks removeAllObjects];
+    for (EDTrack *track in combined) {
         if ([seen containsObject:track.identifier]) continue;
         [seen addObject:track.identifier];
         track.saved = [NSFileManager.defaultManager fileExistsAtPath:[self fileFor:track].path];
@@ -387,12 +496,32 @@ static NSArray<EDTrack *> *EDTracks(id response) {
 @end
 
 static void EDHook(Class cls, NSString *name, id block) {
+    if (!cls) return;
     Method method = class_getInstanceMethod(cls, NSSelectorFromString(name));
-    if (method) method_setImplementation(method, imp_implementationWithBlock(block));
+    if (!method) return;
+    if (!EDInstalledHooks) EDInstalledHooks = [NSMutableDictionary dictionary];
+    NSString *key = [NSStringFromClass(cls) stringByAppendingFormat:@"/%@", name];
+    NSValue *saved = EDInstalledHooks[key];
+    IMP replacement = saved ? (IMP)saved.pointerValue : imp_implementationWithBlock(block);
+    // Retain the first implementation so repeated lifecycle events cannot wrap our own hook.
+    if (!saved) EDInstalledHooks[key] = [NSValue valueWithPointer:replacement];
+    if (method_getImplementation(method) != replacement) class_replaceMethod(cls, NSSelectorFromString(name), replacement, method_getTypeEncoding(method));
 }
 
 static void EDInstallCaptureHooks(void) {
-    Class playerClass = NSClassFromString(@"NowPlaying_PlatformImpl.StatefulPlayerImplementation");
+    // Capture full track identities independently of which list loader builds the visible rows.
+    for (NSString *className in @[@"Collection_DataLoaderImpl.CollectionDataLoaderTrackResponse", @"SPTPlaylistPlatformPlaylistTrackEsperantoImplementation"]) {
+        Class cls = EDClass(className);
+        for (NSString *name in @[@"setName:", @"setURL:", @"setArtists:"]) {
+            SEL selector = NSSelectorFromString(name);
+            IMP original = class_getMethodImplementation(cls, selector);
+            EDHook(cls, name, ^(id object, id value) {
+                ((void (*)(id, SEL, id))original)(object, selector, value);
+                EDRegisterItem(object);
+            });
+        }
+    }
+    Class playerClass = EDClass(@"NowPlaying_PlatformImpl.StatefulPlayerImplementation");
     SEL playerSelector = NSSelectorFromString(@"player:stateDidChange:");
     IMP playerOriginal = class_getMethodImplementation(playerClass, playerSelector);
     EDHook(playerClass, NSStringFromSelector(playerSelector), ^(id object, id player, id state) {
@@ -405,7 +534,7 @@ static void EDInstallCaptureHooks(void) {
     IMP original = class_getMethodImplementation(playlist, selector);
     EDHook(playlist, selectorName, ^id(id object, id url, id options, id policies, id reply, id failure) {
         dispatch_async(dispatch_get_main_queue(), ^{ EDPlaylistLoader = object; EDPlaylistPolicies = [policies copy]; });
-        return ((id (*)(id, SEL, id, id, id, id, id))original)(object, selector, url, options, policies, reply, failure);
+        return ((id (*)(id, SEL, id, id, id, id, id))original)(object, selector, url, options, policies, EDCapturedReply(reply), failure);
     });
     // Modern playlist pages request metadata and track fields together.
     NSString *viewName = @"subscribePlaylistViewWithRecommendationsForPlaylistURL:options:withMetadataProtocols:andTrackProtocols:additionalMetadataExtensions:itemMetadataExtensions:replyOnMainThread:completion:onError:";
@@ -413,7 +542,7 @@ static void EDInstallCaptureHooks(void) {
     IMP viewOriginal = class_getMethodImplementation(playlist, viewSelector);
     EDHook(playlist, viewName, ^id(id object, id url, id options, id metadata, id policies, id extra, id itemExtra, BOOL main, id reply, id failure) {
         dispatch_async(dispatch_get_main_queue(), ^{ EDPlaylistLoader = object; EDPlaylistPolicies = [policies copy]; });
-        return ((id (*)(id, SEL, id, id, id, id, id, id, BOOL, id, id))viewOriginal)(object, viewSelector, url, options, metadata, policies, extra, itemExtra, main, reply, failure);
+        return ((id (*)(id, SEL, id, id, id, id, id, id, BOOL, id, id))viewOriginal)(object, viewSelector, url, options, metadata, policies, extra, itemExtra, main, EDCapturedRecommendationsReply(reply), failure);
     });
     for (NSString *name in @[@"subscribePlaylistViewForPlaylistURL:options:withMetadataProtocols:andTrackProtocols:additionalMetadataExtensions:itemMetadataExtensions:completion:onError:",
                              @"fetchPlaylistViewForPlaylistURL:options:withMetadataProtocols:andTrackProtocols:additionalMetadataExtensions:itemMetadataExtensions:completion:onError:"]) {
@@ -422,54 +551,274 @@ static void EDInstallCaptureHooks(void) {
         if ([name hasPrefix:@"subscribe"]) {
             EDHook(playlist, name, ^id(id object, id url, id options, id metadata, id policies, id extra, id itemExtra, id reply, id failure) {
                 dispatch_async(dispatch_get_main_queue(), ^{ EDPlaylistLoader = object; EDPlaylistPolicies = [policies copy]; });
-                return ((id (*)(id, SEL, id, id, id, id, id, id, id, id))orig)(object, sel, url, options, metadata, policies, extra, itemExtra, reply, failure);
+                return ((id (*)(id, SEL, id, id, id, id, id, id, id, id))orig)(object, sel, url, options, metadata, policies, extra, itemExtra, EDCapturedViewReply(reply), failure);
             });
         } else {
             EDHook(playlist, name, ^(id object, id url, id options, id metadata, id policies, id extra, id itemExtra, id reply, id failure) {
                 dispatch_async(dispatch_get_main_queue(), ^{ EDPlaylistLoader = object; EDPlaylistPolicies = [policies copy]; });
-                ((void (*)(id, SEL, id, id, id, id, id, id, id, id))orig)(object, sel, url, options, metadata, policies, extra, itemExtra, reply, failure);
+                ((void (*)(id, SEL, id, id, id, id, id, id, id, id))orig)(object, sel, url, options, metadata, policies, extra, itemExtra, EDCapturedViewReply(reply), failure);
             });
         }
     }
     for (NSString *className in @[@"Collection_DataLoaderImpl.CollectionEsperantoDataLoader", @"SPTCollectionPlatformDataLoaderImplementation"]) {
-        Class cls = NSClassFromString(className);
+        Class cls = EDClass(className);
         NSString *name = @"subscribeAllTracksWithPolicyProtocols:options:completion:onError:";
         SEL sel = NSSelectorFromString(name);
         IMP orig = class_getMethodImplementation(cls, sel);
         EDHook(cls, name, ^id(id object, id policies, id options, id reply, id failure) {
             dispatch_async(dispatch_get_main_queue(), ^{ EDCollectionLoader = object; EDCollectionPolicies = [policies copy]; EDCollectionWasObserved = YES; });
-            return ((id (*)(id, SEL, id, id, id, id))orig)(object, sel, policies, options, reply, failure);
+            return ((id (*)(id, SEL, id, id, id, id))orig)(object, sel, policies, options, EDCapturedReply(reply), failure);
         });
         NSString *fetchName = @"fetchAllTracksWithPolicyProtocols:options:replyOnMainThread:completion:onError:";
         SEL fetch = NSSelectorFromString(fetchName);
         IMP fetchOriginal = class_getMethodImplementation(cls, fetch);
         EDHook(cls, fetchName, ^(id object, id policies, id options, BOOL main, id reply, id failure) {
             dispatch_async(dispatch_get_main_queue(), ^{ EDCollectionLoader = object; EDCollectionPolicies = [policies copy]; EDCollectionWasObserved = YES; });
-            ((void (*)(id, SEL, id, id, BOOL, id, id))fetchOriginal)(object, fetch, policies, options, main, reply, failure);
+            ((void (*)(id, SEL, id, id, BOOL, id, id))fetchOriginal)(object, fetch, policies, options, main, EDCapturedReply(reply), failure);
         });
     }
 }
 
 static void EDInstallDownloadHook(void) {
-    Class cls = NSClassFromString(@"Offline_ContentOffliningUIImpl.ContentOffliningUIHelperImplementation");
+    Class cls = EDClass(@"Offline_ContentOffliningUIImpl.ContentOffliningUIHelperImplementation");
     NSString *name = @"downloadToggledWithCurrentAvailability:addAction:removeAction:pageIdentifier:pageURI:interactionID:";
     SEL sel = NSSelectorFromString(name);
     IMP original = class_getMethodImplementation(cls, sel);
     EDHook(cls, name, ^(id object, NSInteger availability, id add, id remove, id identifier, NSURL *page, id interaction) {
         NSString *uri = page.absoluteString;
-        if ([uri containsString:@":playlist:"] || [uri containsString:@":collection:tracks"]) {
+        if ([uri containsString:@":playlist:"] || EDIsCollection(uri)) {
             dispatch_async(dispatch_get_main_queue(), ^{ [[EDDownloads shared] openPage:page]; });
-        } else ((void (*)(id, SEL, NSInteger, id, id, id, id, id))original)(object, sel, availability, add, remove, identifier, page, interaction);
+        } else if ([uri containsString:@":album:"] || [uri containsString:@":episode:"] || [uri containsString:@":show:"]) {
+            ((void (*)(id, SEL, NSInteger, id, id, id, id, id))original)(object, sel, availability, add, remove, identifier, page, interaction);
+        } else {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                EDDownloads *downloads = [EDDownloads shared];
+                [downloads show];
+                downloads.statusText = [NSString stringWithFormat:@"Неизвестная страница: %@ (%@). Пришли снимок этого сообщения.", uri ?: @"без URI", identifier ?: @""];
+                [downloads.tableView reloadData];
+            });
+        }
     });
+}
+
+static EDTrack *EDMenuTrack;
+static NSDate *EDMenuDate;
+
+static void EDRememberMenu(id uriValue, id titleValue, id artistValue) {
+    NSString *uri = EDString(uriValue);
+    EDMenuTrack = nil;
+    EDMenuDate = NSDate.date;
+    if (![uri hasPrefix:@"spotify:track:"]) return;
+    NSString *identifier = [[uri componentsSeparatedByString:@":"] lastObject];
+    if (identifier.length != 22 || [identifier rangeOfCharacterFromSet:NSCharacterSet.alphanumericCharacterSet.invertedSet].location != NSNotFound) return;
+    NSString *title = EDString(titleValue);
+    NSString *artist = EDString(artistValue);
+    if (!title.length || !artist.length) return;
+    EDTrack *track = [EDTrack new];
+    track.identifier = identifier; track.title = title; track.artist = artist;
+    track.status = @"Ожидает загрузки";
+    EDMenuTrack = track;
+    EDRememberTrack(track);
+}
+
+static UITableView *EDFindTable(UIView *view) {
+    if ([view isKindOfClass:UITableView.class]) return (UITableView *)view;
+    for (UIView *child in view.subviews) {
+        UITableView *table = EDFindTable(child);
+        if (table) return table;
+    }
+    return nil;
+}
+
+static void EDInstallTrackMenuHooks(void) {
+    for (NSString *className in @[@"SPTContextMenuPresenterFactoryImplementation", @"ContextMenu_PlatformLegacyAdapterImpl.PresenterFactory"]) {
+        Class cls = EDClass(className);
+        NSString *name = @"contextMenuPresenterForHeaderImageURL:headerImagePlaceholder:imageStyle:title:subtitle:metadataTitle:actions:entityURL:headerSubtitleStyle:senderView:options:";
+        SEL selector = NSSelectorFromString(name);
+        IMP original = class_getMethodImplementation(cls, selector);
+        EDHook(cls, name, ^id(id object, id image, id placeholder, NSInteger style, id title, id subtitle, id metadata, id actions, id entity, NSInteger subtitleStyle, id sender, id options) {
+            EDRememberMenu(entity, title, subtitle);
+            return ((id (*)(id, SEL, id, id, NSInteger, id, id, id, id, id, NSInteger, id, id))original)(object, selector, image, placeholder, style, title, subtitle, metadata, actions, entity, subtitleStyle, sender, options);
+        });
+        NSString *trackName = @"contextMenuPresenterForTrackWithTrackURI:trackName:trackMetadata:playable:imageURL:artists:albumName:albumURI:viewURI:contextSourceURI:metadataTitle:logContext:senderView:options:actions:";
+        SEL trackSelector = NSSelectorFromString(trackName);
+        IMP trackOriginal = class_getMethodImplementation(cls, trackSelector);
+        EDHook(cls, trackName, ^id(id object, id uri, id title, id metadata, BOOL playable, id image, id artists, id album, id albumURI, id viewURI, id contextURI, id metadataTitle, id logContext, id sender, id options, id actions) {
+            id result = ((id (*)(id, SEL, id, id, id, BOOL, id, id, id, id, id, id, id, id, id, id, id))trackOriginal)(object, trackSelector, uri, title, metadata, playable, image, artists, album, albumURI, viewURI, contextURI, metadataTitle, logContext, sender, options, actions);
+            id firstArtist = [artists isKindOfClass:NSArray.class] ? [artists firstObject] : artists;
+            NSString *artist = EDString(firstArtist);
+            if (!artist.length) artist = EDString(EDGet(firstArtist, @"name"));
+            EDRememberMenu(uri, title, artist);
+            return result;
+        });
+    }
+    Class cls = EDClass(@"ContextMenu_InternalImpl.ContextMenuViewController");
+    SEL selector = @selector(viewDidAppear:);
+    IMP original = class_getMethodImplementation(cls, selector);
+    EDHook(cls, NSStringFromSelector(selector), ^(UIViewController *controller, BOOL animated) {
+        ((void (*)(id, SEL, BOOL))original)(controller, selector, animated);
+        EDTrack *track = EDMenuTrack;
+        if (!track || -EDMenuDate.timeIntervalSinceNow > 10) return;
+        UITableView *table = EDFindTable(controller.view);
+        if (!table || [table.tableFooterView.accessibilityIdentifier isEqualToString:@"external-download-track"]) return;
+        UIView *existing = table.tableFooterView;
+        CGFloat previousHeight = existing.frame.size.height;
+        UIView *footer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, table.bounds.size.width, previousHeight + 60)];
+        footer.accessibilityIdentifier = @"external-download-track";
+        if (existing) [footer addSubview:existing];
+        UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+        button.frame = CGRectMake(16, previousHeight + 6, MAX(table.bounds.size.width - 32, 100), 48);
+        button.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+        [button setTitle:@"  Скачать трек" forState:UIControlStateNormal];
+        [button setImage:[UIImage systemImageNamed:@"arrow.down.circle"] forState:UIControlStateNormal];
+        button.tintColor = [UIColor colorWithRed:0.12 green:0.84 blue:0.38 alpha:1];
+        button.titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+        button.accessibilityLabel = [NSString stringWithFormat:@"Скачать трек %@", track.title];
+        [button addAction:[UIAction actionWithHandler:^(UIAction *action) {
+            UIViewController *sheet = controller.navigationController ?: controller;
+            if (sheet.presentingViewController) {
+                [sheet dismissViewControllerAnimated:YES completion:^{ [[EDDownloads shared] downloadSingleTrack:track]; }];
+            } else [[EDDownloads shared] downloadSingleTrack:track];
+        }] forControlEvents:UIControlEventTouchUpInside];
+        [footer addSubview:button];
+        table.tableFooterView = footer;
+    });
+}
+
+@interface EDTrackDownloadButton : UIButton
+@property(nonatomic, strong) EDTrack *track;
+@end
+@implementation EDTrackDownloadButton
+- (instancetype)initWithFrame:(CGRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        [self setImage:[UIImage systemImageNamed:@"arrow.down.circle"] forState:UIControlStateNormal];
+        self.tintColor = [UIColor colorWithRed:0.12 green:0.84 blue:0.38 alpha:1];
+        self.accessibilityIdentifier = @"external-download-track-row";
+        [self addTarget:self action:@selector(download) forControlEvents:UIControlEventTouchUpInside];
+    }
+    return self;
+}
+- (void)download {
+    if (self.track) [[EDDownloads shared] downloadSingleTrack:self.track];
+}
+@end
+
+static void EDCollectRowText(UIView *view, NSMutableSet<NSString *> *texts, NSUInteger depth) {
+    if (!depth || [view isKindOfClass:EDTrackDownloadButton.class]) return;
+    if (view.accessibilityLabel.length) [texts addObject:EDNormalized(view.accessibilityLabel)];
+    if ([view isKindOfClass:UILabel.class]) {
+        NSString *text = ((UILabel *)view).text;
+        if (text.length) [texts addObject:EDNormalized(text)];
+    }
+    for (UIView *child in view.subviews) EDCollectRowText(child, texts, depth - 1);
+}
+
+static char EDRowButtonKey;
+static void EDUpdateRowButton(UIView *cell, UIView *content) {
+    if (!cell.window || !content) return;
+    UIResponder *responder = cell;
+    while (responder && ![responder isKindOfClass:UIViewController.class]) responder = responder.nextResponder;
+    if ([responder isKindOfClass:EDDownloads.class]) return;
+    EDTrackDownloadButton *button = objc_getAssociatedObject(cell, &EDRowButtonKey);
+    NSMutableSet *texts = [NSMutableSet set];
+    EDCollectRowText(content, texts, 8);
+    NSString *combined = [NSString stringWithFormat:@" %@ ", [[texts allObjects] componentsJoinedByString:@" "]];
+    NSMutableDictionary *matches = [NSMutableDictionary dictionary];
+    for (NSString *text in texts) {
+        for (EDTrack *track in [EDTracksByTitle[text] allValues]) {
+            NSString *artist = [NSString stringWithFormat:@" %@ ", EDNormalized(track.artist)];
+            if ([combined containsString:artist]) matches[track.identifier] = track;
+        }
+    }
+    // Ambiguous editions never inherit a download button for an unrelated recording.
+    EDTrack *track = matches.count == 1 ? matches.allValues.firstObject : nil;
+    if (!track) { button.track = nil; button.hidden = YES; return; }
+    if (!button) {
+        button = [[EDTrackDownloadButton alloc] initWithFrame:CGRectZero];
+        objc_setAssociatedObject(cell, &EDRowButtonKey, button, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [content addSubview:button];
+    }
+    button.track = track;
+    button.hidden = NO;
+    button.accessibilityLabel = [NSString stringWithFormat:@"Скачать трек %@", track.title];
+    button.frame = CGRectMake(MAX(content.bounds.size.width - 92, 0), MAX((content.bounds.size.height - 44) / 2, 0), 44, 44);
+    [content bringSubviewToFront:button];
+}
+
+static void EDInstallRowHooks(void) {
+    for (Class cls in @[UITableViewCell.class, UICollectionViewCell.class]) {
+        SEL selector = @selector(layoutSubviews);
+        IMP original = class_getMethodImplementation(cls, selector);
+        EDHook(cls, NSStringFromSelector(selector), ^(UIView *cell) {
+            ((void (*)(id, SEL))original)(cell, selector);
+            EDUpdateRowButton(cell, EDGet(cell, @"contentView"));
+        });
+    }
+}
+
+static void EDRefreshRowViews(UIView *view) {
+    if ([view isKindOfClass:UITableViewCell.class] || [view isKindOfClass:UICollectionViewCell.class]) {
+        EDUpdateRowButton(view, EDGet(view, @"contentView"));
+        return;
+    }
+    for (UIView *child in view.subviews) EDRefreshRowViews(child);
+}
+
+static UIWindow *EDActiveWindow(void) {
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (scene.activationState != UISceneActivationStateForegroundActive || ![scene isKindOfClass:UIWindowScene.class]) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) if (window.isKeyWindow) return window;
+    }
+    return nil;
+}
+
+static void EDRefreshRows(void) { EDRefreshRowViews(EDActiveWindow()); }
+
+static void EDShowLoadedMarker(void) {
+    static BOOL shown;
+    UIWindow *window = EDActiveWindow();
+    if (shown || !window) return;
+    shown = YES;
+    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(20, window.safeAreaInsets.top + 6, window.bounds.size.width - 40, 34)];
+    label.text = @"Модуль загрузок v2 загружен";
+    label.textAlignment = NSTextAlignmentCenter;
+    label.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    label.textColor = UIColor.whiteColor;
+    label.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.95];
+    label.layer.cornerRadius = 10;
+    label.clipsToBounds = YES;
+    label.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [window addSubview:label];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ [label removeFromSuperview]; });
+}
+
+static void EDActivate(void) {
+    EDInstallCaptureHooks();
+    EDInstallDownloadHook();
+    EDInstallTrackMenuHooks();
+    EDInstallRowHooks();
+    EDShowLoadedMarker();
+    static BOOL retryScheduled;
+    if (!retryScheduled) {
+        retryScheduled = YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            EDInstallCaptureHooks();
+            EDInstallDownloadHook();
+            EDInstallTrackMenuHooks();
+            EDInstallRowHooks();
+            EDShowLoadedMarker();
+        });
+    }
 }
 
 __attribute__((constructor)) static void EDInitialize(void) {
     @autoreleasepool {
-        if (![[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] isEqualToString:@"9.1.0"]) return;
-        EDInstallCaptureHooks();
-        [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
-            // Install after Eevee's own launch-time initialization.
-            dispatch_async(dispatch_get_main_queue(), ^{ EDInstallDownloadHook(); });
-        }];
+        for (NSString *event in @[UIApplicationDidFinishLaunchingNotification, UIApplicationDidBecomeActiveNotification]) {
+            [NSNotificationCenter.defaultCenter addObserverForName:event object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+                dispatch_async(dispatch_get_main_queue(), ^{ EDActivate(); });
+            }];
+        }
+        // Also works when a signing tool loads injected libraries after the launch notification.
+        dispatch_async(dispatch_get_main_queue(), ^{ EDActivate(); });
     }
 }
