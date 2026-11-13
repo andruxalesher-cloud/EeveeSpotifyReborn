@@ -11,6 +11,7 @@ static __weak id EDCollectionLoader;
 static NSArray *EDPlaylistPolicies;
 static NSArray *EDCollectionPolicies;
 static BOOL EDCollectionWasObserved;
+static __weak id EDSpotifyPlayer;
 
 static NSError *EDError(NSString *message) {
     return [NSError errorWithDomain:@"ExternalDownloads" code:1
@@ -190,7 +191,13 @@ static NSArray<EDTrack *> *EDTracks(id response) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (generation != self.generation) return;
             NSArray *tracks = EDTracks(response);
-            if (!tracks) { failure(EDError(@"Spotify вернул неизвестный формат списка.")); return; }
+            id items = EDGet(response, @"items");
+            if (!tracks || ([items count] > 0 && tracks.count == 0)) { failure(EDError(@"Spotify вернул список без названий песен.")); return; }
+            SEL totalSelector = NSSelectorFromString(@"unrangedLength");
+            if ([response respondsToSelector:totalSelector] &&
+                ((NSUInteger (*)(id, SEL))objc_msgSend)(response, totalSelector) > [items count]) {
+                failure(EDError(@"Spotify вернул только часть плейлиста. Нужна доработка чтения этого списка.")); return;
+            }
             [self beginTracks:tracks];
         });
     };
@@ -213,7 +220,7 @@ static NSArray<EDTrack *> *EDTracks(id response) {
             if (generation != self.generation) return;
             id items = EDGet(response, @"items");
             NSArray *pageTracks = EDTracks(response);
-            if (![items isKindOfClass:NSArray.class] || !pageTracks) {
+            if (![items isKindOfClass:NSArray.class] || !pageTracks || ([items count] > 0 && pageTracks.count == 0)) {
                 self.running = NO; self.statusText = @"Неизвестный формат любимых треков.";
                 [self.tableView reloadData]; return;
             }
@@ -337,7 +344,10 @@ static NSArray<EDTrack *> *EDTracks(id response) {
     self.cursor++;
     [self.tableView reloadData];
     // Serial downloads avoid duplicate writes and keep source requests modest.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{ [self next]; });
+    NSUInteger generation = self.generation;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (generation == self.generation) [self next];
+    });
 }
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task willPerformHTTPRedirection:(NSHTTPURLResponse *)response newRequest:(NSURLRequest *)request completionHandler:(void (^)(NSURLRequest *))completionHandler {
     NSString *host = request.URL.host.lowercaseString;
@@ -362,6 +372,8 @@ static NSArray<EDTrack *> *EDTracks(id response) {
     [tableView deselectRowAtIndexPath:path animated:YES];
     EDTrack *track = self.tracks[path.row];
     if (!track.saved) return;
+    SEL pause = NSSelectorFromString(@"setIsPaused:");
+    if ([EDSpotifyPlayer respondsToSelector:pause]) ((void (*)(id, SEL, BOOL))objc_msgSend)(EDSpotifyPlayer, pause, YES);
     NSError *error;
     [AVAudioSession.sharedInstance setCategory:AVAudioSessionCategoryPlayback error:&error];
     if (!error) [AVAudioSession.sharedInstance setActive:YES error:&error];
@@ -380,12 +392,19 @@ static void EDHook(Class cls, NSString *name, id block) {
 }
 
 static void EDInstallCaptureHooks(void) {
+    Class playerClass = NSClassFromString(@"NowPlaying_PlatformImpl.StatefulPlayerImplementation");
+    SEL playerSelector = NSSelectorFromString(@"player:stateDidChange:");
+    IMP playerOriginal = class_getMethodImplementation(playerClass, playerSelector);
+    EDHook(playerClass, NSStringFromSelector(playerSelector), ^(id object, id player, id state) {
+        dispatch_async(dispatch_get_main_queue(), ^{ EDSpotifyPlayer = object; });
+        ((void (*)(id, SEL, id, id))playerOriginal)(object, playerSelector, player, state);
+    });
     Class playlist = NSClassFromString(@"SPTPlaylistPlatformEsperantoDataLoader");
     NSString *selectorName = @"subscribePlaylistTracksForPlaylistURL:options:withPolicyProtocols:completion:onError:";
     SEL selector = NSSelectorFromString(selectorName);
     IMP original = class_getMethodImplementation(playlist, selector);
     EDHook(playlist, selectorName, ^id(id object, id url, id options, id policies, id reply, id failure) {
-        EDPlaylistLoader = object; EDPlaylistPolicies = policies;
+        dispatch_async(dispatch_get_main_queue(), ^{ EDPlaylistLoader = object; EDPlaylistPolicies = [policies copy]; });
         return ((id (*)(id, SEL, id, id, id, id, id))original)(object, selector, url, options, policies, reply, failure);
     });
     // Modern playlist pages request metadata and track fields together.
@@ -393,17 +412,40 @@ static void EDInstallCaptureHooks(void) {
     SEL viewSelector = NSSelectorFromString(viewName);
     IMP viewOriginal = class_getMethodImplementation(playlist, viewSelector);
     EDHook(playlist, viewName, ^id(id object, id url, id options, id metadata, id policies, id extra, id itemExtra, BOOL main, id reply, id failure) {
-        EDPlaylistLoader = object; EDPlaylistPolicies = policies;
+        dispatch_async(dispatch_get_main_queue(), ^{ EDPlaylistLoader = object; EDPlaylistPolicies = [policies copy]; });
         return ((id (*)(id, SEL, id, id, id, id, id, id, BOOL, id, id))viewOriginal)(object, viewSelector, url, options, metadata, policies, extra, itemExtra, main, reply, failure);
     });
+    for (NSString *name in @[@"subscribePlaylistViewForPlaylistURL:options:withMetadataProtocols:andTrackProtocols:additionalMetadataExtensions:itemMetadataExtensions:completion:onError:",
+                             @"fetchPlaylistViewForPlaylistURL:options:withMetadataProtocols:andTrackProtocols:additionalMetadataExtensions:itemMetadataExtensions:completion:onError:"]) {
+        SEL sel = NSSelectorFromString(name);
+        IMP orig = class_getMethodImplementation(playlist, sel);
+        if ([name hasPrefix:@"subscribe"]) {
+            EDHook(playlist, name, ^id(id object, id url, id options, id metadata, id policies, id extra, id itemExtra, id reply, id failure) {
+                dispatch_async(dispatch_get_main_queue(), ^{ EDPlaylistLoader = object; EDPlaylistPolicies = [policies copy]; });
+                return ((id (*)(id, SEL, id, id, id, id, id, id, id, id))orig)(object, sel, url, options, metadata, policies, extra, itemExtra, reply, failure);
+            });
+        } else {
+            EDHook(playlist, name, ^(id object, id url, id options, id metadata, id policies, id extra, id itemExtra, id reply, id failure) {
+                dispatch_async(dispatch_get_main_queue(), ^{ EDPlaylistLoader = object; EDPlaylistPolicies = [policies copy]; });
+                ((void (*)(id, SEL, id, id, id, id, id, id, id, id))orig)(object, sel, url, options, metadata, policies, extra, itemExtra, reply, failure);
+            });
+        }
+    }
     for (NSString *className in @[@"Collection_DataLoaderImpl.CollectionEsperantoDataLoader", @"SPTCollectionPlatformDataLoaderImplementation"]) {
         Class cls = NSClassFromString(className);
         NSString *name = @"subscribeAllTracksWithPolicyProtocols:options:completion:onError:";
         SEL sel = NSSelectorFromString(name);
         IMP orig = class_getMethodImplementation(cls, sel);
         EDHook(cls, name, ^id(id object, id policies, id options, id reply, id failure) {
-            EDCollectionLoader = object; EDCollectionPolicies = policies; EDCollectionWasObserved = YES;
+            dispatch_async(dispatch_get_main_queue(), ^{ EDCollectionLoader = object; EDCollectionPolicies = [policies copy]; EDCollectionWasObserved = YES; });
             return ((id (*)(id, SEL, id, id, id, id))orig)(object, sel, policies, options, reply, failure);
+        });
+        NSString *fetchName = @"fetchAllTracksWithPolicyProtocols:options:replyOnMainThread:completion:onError:";
+        SEL fetch = NSSelectorFromString(fetchName);
+        IMP fetchOriginal = class_getMethodImplementation(cls, fetch);
+        EDHook(cls, fetchName, ^(id object, id policies, id options, BOOL main, id reply, id failure) {
+            dispatch_async(dispatch_get_main_queue(), ^{ EDCollectionLoader = object; EDCollectionPolicies = [policies copy]; EDCollectionWasObserved = YES; });
+            ((void (*)(id, SEL, id, id, BOOL, id, id))fetchOriginal)(object, fetch, policies, options, main, reply, failure);
         });
     }
 }
