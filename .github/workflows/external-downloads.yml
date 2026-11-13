@@ -22,7 +22,7 @@ jobs:
             -fobjc-arc -fblocks -O2 -Wall -Wextra -Werror=implicit-function-declaration \
             -Wno-unused-parameter -Wno-deprecated-declarations \
             -dynamiclib ExternalDownloads/ExternalDownloads.m \
-            -framework Foundation -framework UIKit -framework AVKit -framework AVFoundation \
+            -framework Foundation -framework UIKit -framework CoreGraphics -framework AVKit -framework AVFoundation \
             -install_name @rpath/ExternalDownloads.dylib \
             -o build/ExternalDownloads.dylib
           codesign --force --sign - build/ExternalDownloads.dylib
